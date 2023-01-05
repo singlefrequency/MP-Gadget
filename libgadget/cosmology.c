@@ -5,19 +5,15 @@
 
 #include "cosmology.h"
 #include "physconst.h"
-#include "utils.h"
+#include <gsl/gsl_interp.h>
 
 /*Stefan-Boltzmann constant in cgs units*/
 #define  STEFAN_BOLTZMANN 5.670373e-5
 
 static inline double OmegaFLD(const Cosmology * CP, const double a);
 
-void init_cosmology(Cosmology * CP, const double TimeBegin, const struct UnitSystem units)
+void init_cosmology(Cosmology * CP, const double TimeBegin)
 {
-    CP->Hubble = HUBBLE * units.UnitTime_in_s;
-    CP->UnitTime_in_s = units.UnitTime_in_s;
-    CP->GravInternal = GRAVITY / pow(units.UnitLength_in_cm, 3) * units.UnitMass_in_g * pow(units.UnitTime_in_s, 2);
-
     /*With slightly relativistic massive neutrinos, for consistency we need to include radiation.
      * A note on normalisation (as of 08/02/2012):
      * CAMB appears to set Omega_Lambda + Omega_Matter+Omega_K = 1,
@@ -28,8 +24,6 @@ void init_cosmology(Cosmology * CP, const double TimeBegin, const struct UnitSys
     CP->OmegaCDM = CP->Omega0 - CP->OmegaBaryon;
     CP->OmegaK = 1.0 - CP->Omega0 - CP->OmegaLambda;
 
-    CP->RhoCrit = 3.0 * CP->Hubble * CP->Hubble / (8.0 * M_PI * CP->GravInternal);  // in internal units
-
     /* Omega_g = 4 \sigma_B T_{CMB}^4 8 \pi G / (3 c^3 H^2) */
 
     CP->OmegaG = 4 * STEFAN_BOLTZMANN
@@ -39,10 +33,6 @@ void init_cosmology(Cosmology * CP, const double TimeBegin, const struct UnitSys
                   / (CP->HubbleParam*CP->HubbleParam);
 
     init_omega_nu(&CP->ONu, CP->MNu, TimeBegin, CP->HubbleParam, CP->CMBTemperature);
-    /*Initialise the hybrid neutrinos, after Omega_nu*/
-    if(CP->HybridNeutrinosOn)
-        init_hybrid_nu(&CP->ONu.hybnu, CP->MNu, CP->HybridVcrit, LIGHTCGS/1e5, CP->HybridNuPartTime, CP->ONu.kBtnu);
-
     /* Neutrinos will be included in Omega0, if massive.
      * This ensures that OmegaCDM contains only non-relativistic species.*/
     if(CP->MNu[0] + CP->MNu[1] + CP->MNu[2] > 0) {
@@ -50,19 +40,94 @@ void init_cosmology(Cosmology * CP, const double TimeBegin, const struct UnitSys
     }
 }
 
-/* Returns 1 if the neutrino particles are 'tracers', not actively gravitating,
- * and 0 if they are actively gravitating particles.*/
-int hybrid_nu_tracer(const Cosmology * CP, double atime)
+#ifdef HubbleTable
+static void
+load_hubbletable(const char * HubbleTable)
 {
-    return CP->HybridNeutrinosOn && (atime <= CP->HybridNuPartTime);
+    /*Hubble table size*/
+    static int NHubbleTable = 0;
+    /*Scale factor*/
+    static double * scale_factor_H = NULL;
+    /*Hubble parameter*/
+    static struct H_fromTable;
+
+    FILE * fd = fopen(HubbleTable, "r");
+    if(!fd)
+        endrun(456, "Could not open table for H(z) at: '%s'\n", HubbleTable);
+
+    /*Find size of file*/
+    NHubbleTable = 0;
+    do
+    {
+        char buffer[1024];
+        char * retval = fgets(buffer, 1024, fd);
+        /*Happens on end of file*/
+        if(!retval)
+            break;
+        retval = strtok(buffer, " \t");
+        /*Discard comments*/
+        if(!retval || retval[0] == '#')
+            continue;
+        NHubbleTable++;
+    }
+    while(1);
+    rewind(fd);
+
+    MPI_Bcast(&(NHubbleTable), 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+    if(NHubbleTable<= 15)
+        endrun(1, "Hubble table contains: %d entries, not enough for interpolation.\n", NHubbleTable);
+
+    /*Allocate memory for the Hubble parameter table.*/
+    scale_factor_H = (double *) mymalloc("HubbleTable", 2 * NHubbleTable * sizeof(double));
+    H_fromTable.ydata = scale_factor_H + NHubbleTable;
+
+    int ThisTask;
+    MPI_Comm_rank(MPI_COMM_WORLD, &ThisTask);
+    if(ThisTask == 0)
+    {
+        int i = 0;
+        while(i < HubbleTable)
+        {
+            char buffer[1024];
+            char * saveptr;
+            char * line = fgets(buffer, 1024, fd);
+            /*Happens on end of file*/
+            if(!line)
+                break;
+            char * retval = strtok_r(line, " \t", &saveptr);
+            if(!retval || retval[0] == '#')
+                continue;
+            scale_factor_H[i] = atof(retval);
+            /*Get the rest*/
+            H_fromTable.ydata[i]   = load_tree_value(&saveptr);
+            i++;
+        }
+
+        fclose(fd);
+    }
+
+    /*Broadcast data to other processors*/
+    MPI_Bcast(H_fromTable, 2 * NHubbleTable, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    /*Initialize the UVB redshift interpolation: reticulate the splines*/
+    init_itp_type(H_fromTable, &H_fromTable, NHubbleTable);
+
+    message(0, "Read %d lines a = %g - %g from file %s\n", NHubbleTable, pow(10, scale_factor_H[0])-1, pow(10, scale_factor_H[NHubbleTable-1])-1, HubbleTable);
 }
+#endif
+
 /*Hubble function at scale factor a, in dimensions of CP.Hubble*/
 double hubble_function(const Cosmology * CP, double a)
 {
 
     double hubble_a;
 
-    /* first do the terms in SQRT */
+    #ifdef
+    static gsl_interp * H_z;
+    H_z = gsl_interp_alloc(gsl_interp_linear,NHubbleTable);
+    hubble_a = gsl_interp_eval(H_z, scale_factor_H, H_fromTable,a, NULL);;
+    hubble_a = CP->Hubble * sqrt(hubble_a);
+    #else
     hubble_a = CP->OmegaLambda;
 
     hubble_a += OmegaFLD(CP, a);
@@ -74,8 +139,9 @@ double hubble_function(const Cosmology * CP, double a)
         hubble_a += get_omega_nu(&CP->ONu, a);
     }
     hubble_a += CP->Omega_ur/(a*a*a*a);
-    /* Now finish it up. */
     hubble_a = CP->Hubble * sqrt(hubble_a);
+    #endif
+
     return (hubble_a);
 }
 
@@ -120,9 +186,6 @@ double growth(Cosmology * CP, double a, double * dDda)
   gsl_odeiv2_driver * drive = gsl_odeiv2_driver_alloc_standard_new(&FF,gsl_odeiv2_step_rkf45, 1e-5, 1e-8,1e-8,1,1);
    /* We start early to avoid lambda.*/
   double curtime = 1e-5;
-  /* Handle even earlier times*/
-  if(a < curtime)
-      curtime = a / 10;
   /* Initial velocity chosen so that D = Omegar + 3/2 Omega_m a,
    * the solution for a matter/radiation universe.*
    * Note the normalisation of D is arbitrary
@@ -164,20 +227,14 @@ static inline double OmegaFLD(const Cosmology * CP, const double a)
     return CP->Omega_fld * pow(a, 3 * (1 + CP->w0_fld + CP->wa_fld))*exp(3*CP->wa_fld*(1-a));
 }
 
-struct sigma2_params
-{
-    FunctionOfK * fk;
-    double R;
-};
-
 static double sigma2_int(double k, void * p)
 {
-    struct sigma2_params * params = (struct sigma2_params *) p;
-    FunctionOfK * fk = params->fk;
-    const double R = params->R;
+    void ** params = p;
+    FunctionOfK * fk = params[0];
+    double * R = params[1];
     double kr, kr3, kr2, w, x;
 
-    kr = R * k;
+    kr = *R * k;
     kr2 = kr * kr;
     kr3 = kr2 * kr;
 
@@ -235,11 +292,11 @@ double function_of_k_eval(FunctionOfK * fk, double k)
 double function_of_k_tophat_sigma(FunctionOfK * fk, double R)
 {
     gsl_integration_workspace * w = gsl_integration_workspace_alloc (1000);
-    struct sigma2_params params = {fk, R};
+    void * params[] = {fk, &R};
     double result,abserr;
     gsl_function F;
     F.function = &sigma2_int;
-    F.params = &params;
+    F.params = params;
 
     /* note: 500/R is here chosen as integration boundary (infinity) */
     gsl_integration_qags (&F, 0, 500. / R, 0, 1e-4,1000,w,&result, &abserr);
@@ -254,39 +311,4 @@ void function_of_k_normalize_sigma(FunctionOfK * fk, double R, double sigma) {
     for(i = 0; i < fk->size; i ++) {
         fk->table[i].Pk *= sigma / old;
     };
-}
-
-/*! Check and print properties of the cosmological unit system.
- */
-void
-check_units(const Cosmology * CP, const struct UnitSystem units)
-{
-    /* Detect cosmologies that are likely to be typos in the parameter files*/
-    if(CP->HubbleParam < 0.1 || CP->HubbleParam > 10 ||
-        CP->OmegaLambda < 0 || CP->OmegaBaryon < 0 || CP->OmegaG < 0 || CP->OmegaCDM < 0)
-        endrun(5, "Bad cosmology: H0 = %g OL = %g Ob = %g Og = %g Ocdm = %g\n",
-               CP->HubbleParam, CP->OmegaLambda, CP->OmegaBaryon, CP->OmegaCDM);
-
-    message(0, "Hubble (internal units) = %g\n", CP->Hubble);
-    message(0, "G (internal units) = %g\n", CP->GravInternal);
-    message(0, "UnitLength_in_cm = %g \n", units.UnitLength_in_cm);
-    message(0, "UnitMass_in_g = %g \n", units.UnitMass_in_g);
-    message(0, "UnitTime_in_s = %g \n", units.UnitTime_in_s);
-    message(0, "UnitVelocity_in_cm_per_s = %g \n", units.UnitVelocity_in_cm_per_s);
-    message(0, "UnitDensity_in_cgs = %g \n", units.UnitDensity_in_cgs);
-    message(0, "UnitEnergy_in_cgs = %g \n", units.UnitEnergy_in_cgs);
-    message(0, "Dark energy model: OmegaL = %g OmegaFLD = %g\n",CP->OmegaLambda, CP->Omega_fld);
-    message(0, "Photon density OmegaG = %g\n",CP->OmegaG);
-    if(!CP->MassiveNuLinRespOn)
-        message(0, "Massless Neutrino density OmegaNu0 = %g\n",get_omega_nu(&CP->ONu, 1));
-    message(0, "Curvature density OmegaK = %g\n",CP->OmegaK);
-    if(CP->RadiationOn) {
-        /* note that this value is inaccurate if there is a massive neutrino. */
-        double OmegaTot = CP->OmegaG + CP->OmegaK + CP->Omega0 + CP->OmegaLambda;
-        if(!CP->MassiveNuLinRespOn)
-            OmegaTot += get_omega_nu(&CP->ONu, 1);
-        message(0, "Radiation is enabled in Hubble(a). "
-               "Following CAMB convention: Omega_Tot - 1 = %g\n", OmegaTot - 1);
-    }
-    message(0, "\n");
 }
